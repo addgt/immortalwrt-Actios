@@ -1,0 +1,12 @@
+#!/bin/sh
+# 覆盖层把用户件放进来了，但权限位靠不住，这里统一补 chmod 并 enable 自启。
+for f in /usr/libexec/u01simd.py /usr/libexec/netled.py /usr/libexec/ledidle.py          /usr/libexec/batled.py /usr/libexec/chg_regs.py; do
+	[ -f "$f" ] && chmod 755 "$f"
+done
+for s in u01sim ledidle netled batled; do
+	[ -f "/etc/init.d/$s" ] || continue
+	chmod 755 "/etc/init.d/$s"
+	/etc/init.d/$s enable
+done
+[ -f /etc/u01sim.conf ] || echo 'sim_slot=0' > /etc/u01sim.conf
+exit 0
