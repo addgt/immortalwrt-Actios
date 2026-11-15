@@ -274,6 +274,64 @@ jobs:
        include-hidden-files: true
 
 
+    - name: U01 早失败检查（内核真开了充电 + 关键包链）
+      run: |
+        cd openwrt
+        # 上一轮是编到 95 分钟才在 glib2 打包时炸（树里缺 libffi），而"内核到底有没有编进
+        # pm8916-lbc / pm8916-bms-vm"这件事在整轮跑完前根本看不到。所以这里把证据提前：
+        # 先单独编 target（工具链+内核），直接读内核合并后的 .config 验两个符号；
+        # 再把卡过的那几个包单独编一遍。已经编好的东西主编译会直接复用，不重复干活。
+        # 上游若不认这个目标名（规则改了）就只警告不拦，别误杀正常构建。
+        LOG=/tmp/u01_early.log
+        if ! make -j$(nproc) target/linux/compile >"$LOG" 2>&1; then
+          if grep -qi "No rule to make target" "$LOG"; then
+            echo "::warning::target/linux/compile 上游不认这个目标，跳过内核侧早检查（编译本身继续）"
+            tail -5 "$LOG"
+          else
+            echo "!! 工具链/内核这一段就先失败，最后 60 行："
+            tail -60 "$LOG"
+            exit 1
+          fi
+        else
+          echo "== 内核 .config 里到底有没有这两个驱动 =="
+          KC=$(ls -1 build_dir/target-*/linux-*/linux-*/.config 2>/dev/null | head -1)
+          echo "   内核配置 = ${KC:-没找到}"
+          [ -n "$KC" ] || { echo "!! 找不到内核 .config，没法证明充电符号生效"; exit 1; }
+          u01_ksym_fail=0
+          for s in CONFIG_CHARGER_PM8916_LBC CONFIG_BATTERY_PM8916_BMS_VM; do
+            if grep -q "^${s}=y" "$KC"; then
+              echo "   OK $s=y 真编进内核了"
+            else
+              echo "   NO $s 没生效，内核里是这样的：$(grep -n "$s" "$KC" | head -2 | tr '\n' ' ')"
+              u01_ksym_fail=1
+            fi
+          done
+          [ "$u01_ksym_fail" = 0 ] || { echo "!! 内核片段没被吃进去，编出来还是不充电的那版，停"; exit 1; }
+        fi
+        # 逐个单编：谁的 Makefile 不在树里就跳过谁，路径按 flat(package/feeds/<feed>/<name>)
+        # 和嵌套两种布局都找一遍，避免因为 feed 布局变了把整轮判死。
+        u01_pkg_fail=""
+        for name in libffi glib2 dbus modemmanager qcom-firmware; do
+          goal=""
+          for c in package/libs/$name package/feeds/*/$name package/feeds/*/*/$name; do
+            [ -e "$c/Makefile" ] && { goal="$c"; break; }
+          done
+          if [ -z "$goal" ]; then
+            echo "!! 找不到 $name 的 Makefile（feed 布局变了？），这一项没法提前验"
+            continue
+          fi
+          echo "== 先单独编 $goal =="
+          if ! make -j$(nproc) $goal/compile >>"$LOG" 2>&1; then
+            echo "!! $name 单编失败，最后 40 行："
+            tail -40 "$LOG"
+            u01_pkg_fail="$u01_pkg_fail $name"
+          else
+            echo "   OK $name 编出来了"
+          fi
+        done
+        [ -z "$u01_pkg_fail" ] || { echo "!! 关键包链在这几个上断了:$u01_pkg_fail"; exit 1; }
+        echo "== U01 早失败检查通过：内核开了充电，glib2/dbus/ModemManager/modem 固件链都编得动 =="
+
     - name: Compile the firmware
       id: compile
       run: |

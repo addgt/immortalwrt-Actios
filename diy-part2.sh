@@ -177,6 +177,36 @@ fi
 # 这里刻意不再往 rc.local 塞 batled.sh：四格灯只留 init.d/batled 一个主人，
 # 两份同时跑会抢同一组 bat:1..4，谁最后写谁说了算，格数会乱跳。
 
+# ---- 5) 补 fork 缺的 libffi（run #2 就是死在这上面，编到 95 分钟才露出来）----
+# 官方 immortalwrt 有 package/libs/libffi，lkiuyu 那份 fork 没有（package/libs 里数得出来）；
+# 而 packages 源里的 glib2 2.88.1 已经把 gobject/gio 子包写成 DEPENDS += +libffi，
+# ModemManager 又必须 glib2 ⇒ 树里没有 libffi，glib2 的 ipk 就打包不出来：
+#   Package glib2-gobject is missing dependencies for the following libraries: libffi.so.8
+#   ERROR: package/feeds/packages/glib2 failed to build.
+# 仓库里带一份和官方同版的（immortalwrt@a4ba8240，libffi 3.8.0 + 官方 22 个 patch），缺才补，不覆盖。
+REPO_DIR="$(cd -- "$(dirname -- "$0")" 2>/dev/null && pwd)"
+if [ -e package/libs/libffi/Makefile ]; then
+	echo "== U01：树里已经有 package/libs/libffi（fork 同步过了），不覆盖 =="
+elif [ -e "$REPO_DIR/u01_local/package/libs/libffi/Makefile" ]; then
+	mkdir -p package/libs
+	cp -a "$REPO_DIR/u01_local/package/libs/libffi" package/libs/
+	echo "== U01：已补 package/libs/libffi（glib2 → ModemManager 的硬依赖）=="
+else
+	echo "!! 仓库里没带 u01_local/package/libs/libffi，libffi 补不上（下面自检会停）"
+fi
+grep -q '^CONFIG_PACKAGE_libffi=y' .config 2>/dev/null || echo 'CONFIG_PACKAGE_libffi=y' >> .config
+
+# ---- 6) 补 mcopy：调制解调器固件包靠它切出来 ----
+# feeds/openstick/firmware/qcom-firmware 的 Build/Compile 是 mcopy（mtools）从
+# openstick-wf2-modem.bin 里取 ::image/mba.mbn ::image/modem.* ::image/wcnss.*，
+# 而 workflow 装的那个依赖清单（xuxin1955/depend_ubuntu2204_openwrt，93 项）里没有 mtools。
+# 缺它 ⇒  modem 固件包报错 ⇒ 又白等一次。这里现装，装不上就直接停。
+if ! command -v mcopy >/dev/null 2>&1; then
+	echo "== U01：runner 上没有 mcopy，尝试补装 mtools =="
+	sudo -E apt-get -y install mtools >/tmp/u01_mtools.log 2>&1 || tail -5 /tmp/u01_mtools.log
+	command -v mcopy >/dev/null 2>&1 && echo "== U01：mcopy 已就位 $(command -v mcopy) =="
+fi
+
 # 注入自检：哪一项没落上就直接终止，别花一个半小时编一版跟上一版一样的固件
 u01_fail=0
 grep -q '^CONFIG_BATTERY_PM8916_BMS_VM=y' $CFG                       || { echo "!! BMS-VM 没进 $CFG"; u01_fail=1; }
@@ -196,9 +226,36 @@ for f in usr/libexec/u01simd.py usr/libexec/netled.py usr/libexec/ledidle.py \
 done
 grep -q '^CONFIG_PACKAGE_python3=y' .config 2>/dev/null \
 	|| echo "!! 警告：.config 里 python3 没开，用户态服务全都起不来（应改 config/wf2.config）"
+[ -e package/libs/libffi/Makefile ] || { echo "!! package/libs/libffi 不在树里，glib2 打不出 ipk"; u01_fail=1; }
+command -v mcopy >/dev/null 2>&1    || { echo "!! 没有 mcopy，qcom-firmware 切不出 mba.mbn/modem.*"; u01_fail=1; }
 if [ "$u01_fail" != 0 ]; then
 	echo "== U01 注入自检失败，终止编译 =="
 	ls -l "$OVL/etc/" 2>&1 | sed 's/^/   /'
 	exit 1
 fi
-echo "== U01 注入自检通过：BMS-VM + LBC 充电 + bat:1..4 + 覆盖层用户件齐全 =="
+echo "== U01 注入自检通过：BMS-VM + LBC 充电 + bat:1..4 + 覆盖层用户件齐全 + libffi/mcopy 就位 =="
+
+# ---- 7) 依赖缺口体检（只报，不拦）----
+# prepare-tmpinfo 扫全部 Makefile 时会把"某包依赖一个整棵树都不存在的包名"打成
+#   WARNING: Makefile 'package/feeds/packages/glib2/Makefile' has a dependency on 'libffi', which does not exist
+# 上次这行在编译开头就印出来了（日志 L24），却要等到 95 分钟后的打包阶段才变成真错误。
+# 这里把它提前打出来当线索。注意不能拿来当门槛：busybox→libpam/libtirpc、python3→libffi
+# 都是条件依赖（没真选上那条扩展就永远不碰），按名字拦会把好端端的构建误杀。
+# 真正会拦下来的是上面那条硬检查（libffi 必须已经在树里）+ workflow 里的"关键链先编"。
+echo "== U01：依赖缺口体检 =="
+u01_scan=/tmp/u01_scan.log
+make prepare-tmpinfo >"$u01_scan" 2>&1 || make prereq >>"$u01_scan" 2>&1 || true
+if grep -q "which does not exist" "$u01_scan" 2>/dev/null; then
+	echo "   （下面这些是\"树里没有这个包名\"，被选中的包标了 STAR，只当线索）"
+	u01_re="Makefile '([^']+)' has a (build )?dependency on '([^']+)', which does not exist"
+	while IFS= read -r line; do
+		[[ "$line" =~ $u01_re ]] || continue
+		src="${BASH_REMATCH[1]}"; dep="${BASH_REMATCH[3]}"
+		pkg="${src%/*}"; pkg="${pkg##*/}"
+		if grep -qE "^CONFIG_(PACKAGE|DEFAULT)_${pkg}=y" .config 2>/dev/null; then
+			echo "  ★ $pkg 需要 $dep（$pkg 已被选中，条件依赖也会这样显示，别直接当故障）"
+		fi
+	done < "$u01_scan"
+else
+	echo "   没有扫出依赖缺口"
+fi
