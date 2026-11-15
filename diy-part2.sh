@@ -207,6 +207,40 @@ if ! command -v mcopy >/dev/null 2>&1; then
 	command -v mcopy >/dev/null 2>&1 && echo "== U01：mcopy 已就位 $(command -v mcopy) =="
 fi
 
+# ---- 7) 合掉 netfilter 那对抢同一个 .ko 的包（run #4 死因）----
+# 锁定树 package/kernel/linux/modules/netfilter.mk 里同时有：
+#   KernelPackage/iptables  HIDDEN, DEPENDS:=@!LINUX_6_12,
+#                           FILES = net/ipv4/netfilter/ip_tables.ko + net/netfilter/x_tables.ko
+#   KernelPackage/nf-ipt    DEPENDS:=+!LINUX_6_12:kmod-iptables,
+#                           FILES = $(NF_IPT-m) = 上面同两个 .ko（include/netfilter.mk:32-33）
+# 内核是 6.18（不是 6.12）⇒ 两个包都进 rootfs ⇒ opkg 在 package/install 判数据文件冲突：
+#   check_data_file_clashes: Package kmod-nf-ipt wants to install file .../ip_tables.ko
+#   Cannot install package kmod-nf-ipt / kmod-nf-ipt6 / kmod-ipt-core / kmod-nft-compat
+#   package/Makefile:100: package/install Error 255     ← 96 分钟才走到这一步
+# 上游 master 已经没有 KernelPackage/iptables，改把三个 *_LEGACY 的 KCONFIG 直接挂进
+# nf-ipt / nf-ipt6 / ebtables（.ko 归 nf-ipt 一家打）。这里照 master 的做法合一，
+# 补丁用 t_dep/mk_nfpatch.py 从锁定 hash 的真实文件生成，本地 patch -p1 往返验过。
+NFMK=package/kernel/linux/modules/netfilter.mk
+NFPATCH="$REPO_DIR/u01_local/patches/netfilter-ipt-clash.patch"
+if ! grep -q '^define KernelPackage/iptables$' $NFMK 2>/dev/null; then
+	echo "== U01：netfilter 已经是不重复打包的那版（fork 同步过了），跳过 =="
+elif [ ! -f "$NFPATCH" ]; then
+	echo "!! 仓库里没带 u01_local/patches/netfilter-ipt-clash.patch，合一补丁打不上"
+elif ! command -v patch >/dev/null 2>&1; then
+	echo "!! runner 上没有 patch(1)"
+else
+	if patch -p1 -N --dry-run < "$NFPATCH" >/tmp/u01_nf.log 2>&1 &&
+	   patch -p1 -N < "$NFPATCH" >>/tmp/u01_nf.log 2>&1; then
+		echo "== U01：已打 netfilter 合一补丁（ip_tables.ko/x_tables.ko 只留 kmod-nf-ipt 一个户主）=="
+	else
+		echo "!! netfilter 补丁试打/正打失败，树和锁定 hash 对不上号，尾部："
+		tail -20 /tmp/u01_nf.log
+	fi
+	# 谁还引用被删掉的包名，第 1 分钟就说出来，别等 96 分钟后 opkg 报"依赖满足不了"
+	u01_ref=$(grep -rl --include=Makefile --include='*.mk' 'kmod-iptables' package feeds 2>/dev/null | head -10 || true)
+	[ -n "$u01_ref" ] && echo "::warning::打完补丁仍有文件引用 kmod-iptables：$(echo $u01_ref | tr '\n' ' ')"
+fi
+
 # 注入自检：哪一项没落上就直接终止，别花一个半小时编一版跟上一版一样的固件
 u01_fail=0
 grep -q '^CONFIG_BATTERY_PM8916_BMS_VM=y' $CFG                       || { echo "!! BMS-VM 没进 $CFG"; u01_fail=1; }
@@ -228,12 +262,15 @@ grep -q '^CONFIG_PACKAGE_python3=y' .config 2>/dev/null \
 	|| echo "!! 警告：.config 里 python3 没开，用户态服务全都起不来（应改 config/wf2.config）"
 [ -e package/libs/libffi/Makefile ] || { echo "!! package/libs/libffi 不在树里，glib2 打不出 ipk"; u01_fail=1; }
 command -v mcopy >/dev/null 2>&1    || { echo "!! 没有 mcopy，qcom-firmware 切不出 mba.mbn/modem.*"; u01_fail=1; }
+[ -f "$NFMK" ] || { echo "!! $NFMK 不在树里（锁定 hash 变了？路径找不到）"; u01_fail=1; }
+grep -q '^define KernelPackage/iptables$' $NFMK 2>/dev/null \
+	&& { echo "!! netfilter 合一补丁没生效，kmod-iptables 还在和 kmod-nf-ipt 抢 ip_tables.ko"; u01_fail=1; }
 if [ "$u01_fail" != 0 ]; then
 	echo "== U01 注入自检失败，终止编译 =="
 	ls -l "$OVL/etc/" 2>&1 | sed 's/^/   /'
 	exit 1
 fi
-echo "== U01 注入自检通过：BMS-VM + LBC 充电 + bat:1..4 + 覆盖层用户件齐全 + libffi/mcopy 就位 =="
+echo "== U01 注入自检通过：BMS-VM + LBC 充电 + bat:1..4 + 覆盖层用户件齐全 + libffi/mcopy 就位 + netfilter 已合一 =="
 
 # ---- 7) 依赖缺口体检（只报，不拦）----
 # prepare-tmpinfo 扫全部 Makefile 时会把"某包依赖一个整棵树都不存在的包名"打成
