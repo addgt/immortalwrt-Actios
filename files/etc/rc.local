@@ -5,4 +5,6 @@
 # cd /root/picoclaw && ./picoclaw-launcher -public > /root/picoclaw/picoclaw.log 2>&1 &
 # SimAdmin 这个是管理sim手机卡的程序，开源地址：https://github.com/3899/SimAdmin
 # cd /root/simadmin && ./simadmin > /root/simadmin/simadmin.log 2>&1 &
+# 电量四格灯不要在这里起：它由 /etc/init.d/batled（跑 /usr/libexec/batled.py）常驻管，
+# rc.local 再起一份 /etc/batled.sh 的话，两个进程写同一组 bat:1..4，格数会乱跳。
 exit 0

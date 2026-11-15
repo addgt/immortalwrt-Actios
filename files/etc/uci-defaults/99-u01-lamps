@@ -7,6 +7,9 @@ for s in u01sim ledidle netled batled; do
 	[ -f "/etc/init.d/$s" ] || continue
 	chmod 755 "/etc/init.d/$s"
 	/etc/init.d/$s enable
+	# enable 只是建 rc.d 软链，而 uci-defaults 跑在 boot 的 done 阶段（软链早就读过了），
+	# 不 start 的话第一次开机这几个服务是死的，得等第二次开机。
+	/etc/init.d/$s start
 done
 [ -f /etc/u01sim.conf ] || echo 'sim_slot=0' > /etc/u01sim.conf
 exit 0

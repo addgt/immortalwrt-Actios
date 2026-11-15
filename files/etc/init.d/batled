@@ -1,7 +1,8 @@
 #!/bin/sh /etc/rc.common
 # 四格电量灯：电压查表出格数（BMS-VM 的 voltage_now 优先，退到 PMIC ADC VSYS）。
 # 只写 leds class 的 bat:1..4，不碰裸 TLMM 脚。
-START=97
+# START=99 是设备上跑通的那版（batled.initd），别乱改顺序，u01sim 在 25。
+START=99
 STOP=10
 USE_PROCD=1
 

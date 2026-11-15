@@ -59,12 +59,11 @@ sed -i 's/luci-theme-bootstrap/luci-theme-argon/g' feeds/luci/collections/luci/M
 #    再补 4 格电量灯 bat:1..bat:4（脚 0/91/1/100 = 原厂 DTB 的 bat1/batl2/batl3/batl4），
 #    并把这 4 个脚加进 &gpio_leds_default 的 pins，否则 pinctrl 不切功能。
 #
-# 3) /etc 文件走 package/base-files/files：
-#    仓库顶层 files/ 覆盖层其实也生效（上游 include/image.mk 里有
-#    `$(call prepare_rootfs,$(mkfs_cur_target_dir),$(TOPDIR)/files)`，而 workflow 第一步
-#    `cp -r files openwrt/files` 是建目录、成功的；后面那句 `mv files openwrt/files`
-#    只是多塞一份 openwrt/files/files/ 出来，无害）。
-#    两条路都能用，这里仍走 base-files，因为它不依赖 workflow 那两步的顺序。
+# 3) 用户态文件走仓库顶层 files/ 覆盖层（不走 package/base-files/files）：
+#    上游 include/image.mk 里有 `$(call prepare_rootfs,$(mkfs_cur_target_dir),$(TOPDIR)/files)`
+#    ⇒ TOPDIR(files) 才是镜像吃的目录。workflow 先用 `cp -r files openwrt/files` 把它建出来（生效），
+#    随后 `mv files openwrt/files` 把仓库根那份搬空、在 openwrt/files/files/ 留一坨重复垃圾
+#    （本脚本会顺手删掉）。⇒ 想改 /etc 就往仓库 files/ 里放，但**自检要按 openwrt/files 验**。
 #
 # 4) DTS 是哪一份：target/linux/msm89xx/image/msm8916.mk 里 openstick-wf2 写死
 #    DEVICE_DTS := msm8916-xinxun-wf2 + DEVICE_DTS_DIR := ../dts，
@@ -76,8 +75,6 @@ sed -i 's/luci-theme-bootstrap/luci-theme-argon/g' feeds/luci/collections/luci/M
 #             子目标 msm8916 只有 target.mk（没有自己的 config-6.18）=> 改 target 级那份就够。
 # ============================================================
 U01_MARK="U01 (battery stick) overrides"
-SRC_DIR="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
-[ -f "$SRC_DIR/files/usr/libexec/batled.py" ] || SRC_DIR="$GITHUB_WORKSPACE"
 
 # 内核配置片段的名字必须跟着上游走，不能写死：
 #   lkiuyu/immortalwrt 上游锁 7fe583d9 => KERNEL_PATCHVER:=6.12，那棵树里【没有】config-6.18；
@@ -155,11 +152,28 @@ cat >> $DTS <<'CHGEOF'
 CHGEOF
 fi
 
-# 用户态（u01simd/netled/ledidle/batled/chg_regs + 三个 init.d + /etc/u01sim.conf）
-# 不再由本脚本 cp 安装，改走仓库顶层 files/ 覆盖层：
-# 上游 include/image.mk 里有 $(call prepare_rootfs,$(mkfs_cur_target_dir),$(TOPDIR)/files)，
-# workflow 第一步 `cp -r files openwrt/files` 也是建目录、生效的（后面那句 mv 只是多塞一份）。
-# 首启用 files/etc/uci-defaults/99-u01-lamps 补 chmod + enable（git 里带的文件权限不可靠）。
+# 用户态（u01simd/netled/ledidle/batled/chg_regs + 四个 init.d + /etc/u01sim.conf
+# + etc/uci-defaults/99-u01-lamps）不由本脚本 cp 安装，走仓库顶层 files/ 覆盖层。
+# 覆盖层确实生效：上游 include/image.mk 里有 $(call prepare_rootfs,$(mkfs_cur_target_dir),$(TOPDIR)/files)。
+#
+# ⚠️ 但"仓库根那份 files/"在本步执行时已经不存在了 —— workflow 顺序是
+#      step " files"                 : cp -r files openwrt/files        （建目录，这份才算数）
+#      step "Load custom configuration": [ -e files ] && mv files openwrt/files
+#    第二次是往已存在目录里挪 ⇒ 变成 openwrt/files/files/ 的重复垃圾，仓库根 files/ 被搬空。
+#    11-16 那次编译就是在这里自检失败退出的（当时十项全去找仓库根 ⇒ 全空 ⇒ exit 1）。
+#    所以要验就验 $(TOPDIR)/files（本步 CWD 就是 openwrt 根），它才是镜像真正吃的那一份。
+OVL=files
+if [ ! -s "$OVL/usr/libexec/batled.py" ]; then
+	for c in "$GITHUB_WORKSPACE/files" "$(dirname -- "$0")/files"; do
+		[ -s "$c/usr/libexec/batled.py" ] && { OVL="$c"; break; }
+	done
+fi
+[ -s "$OVL/usr/libexec/batled.py" ] || OVL=""
+echo "== U01：覆盖层落点 = ${OVL:-没找到（下面会报缺）} =="
+# 清掉 mv 造出来的重复副本，否则它以 /files/ 白占镜像约 100KB
+if [ -n "$OVL" ] && [ -s "$OVL/files/usr/libexec/batled.py" ]; then
+	rm -rf "$OVL/files" && echo "== U01：已清掉 mv 造成的重复副本 $OVL/files/ =="
+fi
 # 这里刻意不再往 rc.local 塞 batled.sh：四格灯只留 init.d/batled 一个主人，
 # 两份同时跑会抢同一组 bat:1..4，谁最后写谁说了算，格数会乱跳。
 
@@ -172,18 +186,19 @@ grep -q "$U01_MARK" $DTS                                             || { echo "
 grep -q '&pm8916_charger' $DTS                                       || { echo "!! 充电块没进 $DTS"; u01_fail=1; }
 grep -q '&pm8916_usbin' $DTS                                         || { echo "!! 没把 pm8916_usbin 关掉，usb_vbus 中断线会撞车(-EBUSY)"; u01_fail=1; }
 grep -q 'u01_bat:' $DTS                                              || { echo "!! $DTS 里没有 u01_bat，充电器引用的 battery 节点不存在"; u01_fail=1; }
-# 用户态件走 files/ 覆盖层，这里只验它们真在仓库里（不在就说明 fork 少上传了文件）
-for f in files/usr/libexec/u01simd.py files/usr/libexec/netled.py files/usr/libexec/ledidle.py \
-         files/usr/libexec/batled.py files/usr/libexec/chg_regs.py \
-         files/etc/init.d/u01sim files/etc/init.d/netled files/etc/init.d/ledidle \
-         files/etc/init.d/batled files/etc/uci-defaults/99-u01-lamps; do
-	[ -s "$SRC_DIR/$f" ] || { echo "!! 覆盖层缺文件 $f (SRC_DIR=$SRC_DIR)"; u01_fail=1; }
+# 用户件走 files/ 覆盖层，这里验的是"镜像会吃到的那一份"里十件齐全
+# （首启由 etc/uci-defaults/99-u01-lamps 补 chmod + enable，git 带过来的权限位不可靠）
+for f in usr/libexec/u01simd.py usr/libexec/netled.py usr/libexec/ledidle.py \
+         usr/libexec/batled.py usr/libexec/chg_regs.py \
+         etc/init.d/u01sim etc/init.d/netled etc/init.d/ledidle \
+         etc/init.d/batled etc/uci-defaults/99-u01-lamps; do
+	[ -n "$OVL" ] && [ -s "$OVL/$f" ] || { echo "!! 覆盖层缺文件 $f (OVL=${OVL:-无})"; u01_fail=1; }
 done
 grep -q '^CONFIG_PACKAGE_python3=y' .config 2>/dev/null \
 	|| echo "!! 警告：.config 里 python3 没开，用户态服务全都起不来（应改 config/wf2.config）"
 if [ "$u01_fail" != 0 ]; then
 	echo "== U01 注入自检失败，终止编译 =="
-	ls -l "$SRC_DIR/files/etc/" 2>&1 | sed 's/^/   /'
+	ls -l "$OVL/etc/" 2>&1 | sed 's/^/   /'
 	exit 1
 fi
 echo "== U01 注入自检通过：BMS-VM + LBC 充电 + bat:1..4 + 覆盖层用户件齐全 =="
