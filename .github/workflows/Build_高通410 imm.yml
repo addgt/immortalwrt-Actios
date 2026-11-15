@@ -369,21 +369,32 @@ jobs:
         [ -n "$BOOT" ] || { echo "!! 没有 boot.img"; fail=1; }
         [ -n "$SYS" ] || { echo "!! 没有 system.img"; fail=1; }
         ls -l ${D} 2>/dev/null | tail -15
-        echo "== 3) boot 里追加的 DTB 明文 token（gz 压缩的内核搜不到，DTB 是明文）=="
+        echo "== 3) boot 里的设备树按 FDT 解析（run#5 教训：label 名 u01_bat、DTS 文件名 msm8916-xinxun-wf2"
+        echo "        和 status=okay 都不会以明文出现在编译出的 DTB 里，grep 二进制的断言必然假红）=="
         B=$BOOT
-        if [ -n "$B" ]; then
-          case "$B" in *.gz) gunzip -kc "$B" >/tmp/u01_boot.img; B=/tmp/u01_boot.img ;; esac
+        PY=$(command -v python3 || command -v python)
+        if [ -z "$PY" ]; then
+          echo "!! runner 上没有 python，没法按 FDT 解析设备树，这一项不能算过"; fail=1
+        elif [ -z "$B" ]; then
+          :
+        else
+          case "$B" in *.gz) gunzip -kc "$B" >"${B%.gz}.u01chk"; B="${B%.gz}.u01chk" ;; esac
           ls -l "$B"
-          for tok in u01_bat "bat:1" msm8916-xinxun-wf2 qcom,pm8916-lbc qcom,pm8916-bms-vm; do
-            n=$(grep -a -c -- "$tok" "$B" 2>/dev/null || true)
-            if [ "${n:-0}" -gt 0 ]; then echo "   OK $tok 命中 $n 行"; else echo "   NO $tok 在 boot 里搜不到"; fail=1; fi
-          done
+          # 这里刻意不用 heredoc：YAML 块标量里任何一行的缩进掉回第 0 列，整个 run 就断了
+          DTB=$(find build_dir -name '*wf2*.dtb' -size +1k 2>/dev/null | head -1)
+          if [ -z "$DTB" ]; then
+            echo "!! build_dir 里找不到 *wf2*.dtb，没法证明产物用的就是那一棵树"; fail=1
+            "$PY" "$GITHUB_WORKSPACE/u01_local/fdtpeek.py" "$B" --check || fail=1
+          else
+            "$PY" "$GITHUB_WORKSPACE/u01_local/fdtpeek.py" "$B" --check --dtb "$DTB" || fail=1
+          fi
         fi
         if [ "$fail" != 0 ]; then
           echo "!! U01 产物校验没过：这一版就算刷进去也不满足需求（不充电 / 灯不对 / 镜像缺），停住不发 release"
           exit 1
         fi
-        echo "== U01 产物校验通过：内核开了 LBC 充电 + BMS-VM 电量计，boot/system 都在，DTB 带着 wf2 改动 =="
+        echo "== U01 产物校验通过：内核开了 LBC 充电 + BMS-VM 电量计，boot/system 都在，"
+        echo "   且设备树里 charger/battery 两个节点 status=okay、monitored-battery 指得到 simple-battery、usb-detect 已让出 vbus =="
 
     - name: Get kernel version
       run: |
