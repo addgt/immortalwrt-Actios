@@ -277,60 +277,57 @@ jobs:
     - name: U01 早失败检查（内核真开了充电 + 关键包链）
       run: |
         cd openwrt
-        # 上一轮是编到 95 分钟才在 glib2 打包时炸（树里缺 libffi），而"内核到底有没有编进
-        # pm8916-lbc / pm8916-bms-vm"这件事在整轮跑完前根本看不到。所以这里把证据提前：
-        # 先单独编 target（工具链+内核），直接读内核合并后的 .config 验两个符号；
-        # 再把卡过的那几个包单独编一遍。已经编好的东西主编译会直接复用，不重复干活。
-        # 上游若不认这个目标名（规则改了）就只警告不拦，别误杀正常构建。
-        LOG=/tmp/u01_early.log
-        if ! make -j$(nproc) target/linux/compile >"$LOG" 2>&1; then
-          if grep -qi "No rule to make target" "$LOG"; then
-            echo "::warning::target/linux/compile 上游不认这个目标，跳过内核侧早检查（编译本身继续）"
-            tail -5 "$LOG"
-          else
-            echo "!! 工具链/内核这一段就先失败，最后 60 行："
-            tail -60 "$LOG"
-            exit 1
+        # 上一轮 95 分钟才在 glib2 打包时炸（树里缺 libffi），所以先把工具链+内核和那条依赖链
+        # 单独编一遍；编好的东西主编译直接复用，不重复干活。
+        # ⚠️ 第 3 跑实测：make target/linux/compile 33 秒就失败，而且【一个字都不往 stdout 打】
+        #    （include/subdir.mk 的 log_make 只在 BUILD_LOG 打开时才 tee 到 logs/），
+        #    当时它还 exit 1 把整轮带走了 —— 拦路可以，拦路又说不出原因不行。
+        #    所以这一段改成：V=s 强制详细输出 + 自己把 logs/ 和 grep 结果挖出来 + 永不失败；
+        #    真正的判死挪到编译之后的 "U01 产物校验"（那时内核 .config 和镜像必然存在）。
+        dump() {
+          echo "---- 日志里的报错行 ----"
+          grep -n -m 40 -E "\*\*\*|Error [0-9]|error:|No rule to make|No such file|command not found|failed to build" "$1" | tail -40
+          echo "---- 最后 $2 行 ----"
+          tail -"$2" "$1"
+          if [ -d logs ]; then
+            for f in $(find logs -type f \( -name '*target*' -o -name '*error*' \) 2>/dev/null | head -4); do
+              echo "---- $f 尾部 ----"; tail -40 "$f"
+            done
           fi
+          true
+        }
+        LOG=/tmp/u01_early.log
+        echo "== 1) target/linux/compile（工具链+内核）=="
+        if make -j$(nproc) V=s target/linux/compile >"$LOG" 2>&1; then
+          echo "   OK target 这一段单独编过了，主编译会直接复用"
         else
-          echo "== 内核 .config 里到底有没有这两个驱动 =="
-          KC=$(ls -1 build_dir/target-*/linux-*/linux-*/.config 2>/dev/null | head -1)
-          echo "   内核配置 = ${KC:-没找到}"
-          [ -n "$KC" ] || { echo "!! 找不到内核 .config，没法证明充电符号生效"; exit 1; }
-          u01_ksym_fail=0
-          for s in CONFIG_CHARGER_PM8916_LBC CONFIG_BATTERY_PM8916_BMS_VM; do
-            if grep -q "^${s}=y" "$KC"; then
-              echo "   OK $s=y 真编进内核了"
-            else
-              echo "   NO $s 没生效，内核里是这样的：$(grep -n "$s" "$KC" | head -2 | tr '\n' ' ')"
-              u01_ksym_fail=1
-            fi
-          done
-          [ "$u01_ksym_fail" = 0 ] || { echo "!! 内核片段没被吃进去，编出来还是不充电的那版，停"; exit 1; }
+          echo "::warning::target/linux/compile 单编失败 —— 只报警不拦路，主编译照跑，内核有没有充电由编译后那一步判死"
+          dump "$LOG" 60
         fi
-        # 逐个单编：谁的 Makefile 不在树里就跳过谁，路径按 flat(package/feeds/<feed>/<name>)
-        # 和嵌套两种布局都找一遍，避免因为 feed 布局变了把整轮判死。
-        u01_pkg_fail=""
+        KC=$(ls -1 build_dir/target-*/linux-*/linux-*/.config 2>/dev/null | head -1)
+        echo "   内核 .config = ${KC:-还没生成（这一段失败的话，编译后补验）}"
+        if [ -n "$KC" ]; then
+          for s in CONFIG_CHARGER_PM8916_LBC CONFIG_BATTERY_PM8916_BMS_VM; do
+            if grep -q "^${s}=y" "$KC"; then echo "   OK $s=y"
+            else echo "::warning::$s 没生效，现状：$(grep -n "$s" "$KC" | head -3 | tr '\n' ' ')"; fi
+          done
+        fi
+        echo "== 2) 关键包链（libffi → glib2 → dbus → ModemManager → modem 固件）=="
         for name in libffi glib2 dbus modemmanager qcom-firmware; do
           goal=""
           for c in package/libs/$name package/feeds/*/$name package/feeds/*/*/$name; do
             [ -e "$c/Makefile" ] && { goal="$c"; break; }
           done
-          if [ -z "$goal" ]; then
-            echo "!! 找不到 $name 的 Makefile（feed 布局变了？），这一项没法提前验"
-            continue
-          fi
-          echo "== 先单独编 $goal =="
-          if ! make -j$(nproc) $goal/compile >>"$LOG" 2>&1; then
-            echo "!! $name 单编失败，最后 40 行："
-            tail -40 "$LOG"
-            u01_pkg_fail="$u01_pkg_fail $name"
-          else
+          if [ -z "$goal" ]; then echo "::warning::找不到 $name 的 Makefile（feed 布局变了？），这一项没提前验到"; continue; fi
+          if make -j$(nproc) V=s $goal/compile >>"$LOG" 2>&1; then
             echo "   OK $name 编出来了"
+          else
+            echo "::warning::$name 单编失败，最后 40 行："
+            tail -40 "$LOG"
           fi
         done
-        [ -z "$u01_pkg_fail" ] || { echo "!! 关键包链在这几个上断了:$u01_pkg_fail"; exit 1; }
-        echo "== U01 早失败检查通过：内核开了充电，glib2/dbus/ModemManager/modem 固件链都编得动 =="
+        echo "== 早检查到此为止（这一段永不失败），下面进主编译 =="
+
 
     - name: Compile the firmware
       id: compile
@@ -342,6 +339,51 @@ jobs:
         grep '^CONFIG_TARGET.*DEVICE.*=y' .config | sed -r 's/.*DEVICE_(.*)=y/\1/' > DEVICE_NAME
         [ -s DEVICE_NAME ] && echo "DEVICE_NAME=_$(cat DEVICE_NAME)" >> $GITHUB_ENV
         echo "FILE_DATE=_$(date +"%Y%m%d%H%M")" >> $GITHUB_ENV
+
+    - name: U01 产物校验（内核真开充电 + boot/system 落地 + DTB 改动在镜像里）
+      run: |
+        cd openwrt
+        # 这一刀才是真正判死的地方：整片编完之后，内核 .config 和 bin/targets 里的镜像必然存在，
+        # 所以每一项都能实证，不会像"早检查"那样因为目标本身跑不动而说不出原因。
+        # 目的：绝不再发一版"编过了但不充电"的固件出去（那等于白刷一次机）。
+        fail=0
+        echo "== 1) 合并后的内核 .config =="
+        KC=$(ls -1 build_dir/target-*/linux-*/linux-*/.config 2>/dev/null | head -1)
+        if [ -z "$KC" ]; then
+          echo "!! build_dir 里找不到内核 .config，没法证明充电驱动编进去了"; fail=1
+        else
+          echo "   $KC"
+          for s in CONFIG_CHARGER_PM8916_LBC CONFIG_BATTERY_PM8916_BMS_VM; do
+            if grep -q "^${s}=y" "$KC"; then
+              echo "   OK $s=y 真编进内核了"
+            else
+              echo "   NO $s -> 现状：$(grep -n "$s" "$KC" | head -3 | tr '\n' ' ')"; fail=1
+            fi
+          done
+        fi
+        echo "== 2) 产物（Organize files 就认 boot.img / system.img 这两个名字）=="
+        D=$(ls -1d bin/targets/*/*/ 2>/dev/null | head -1)
+        echo "   目录 = ${D:-没有}"
+        BOOT=$(ls ${D}*oot.img.gz ${D}*oot.img 2>/dev/null | head -1)
+        SYS=$(ls ${D}*ystem.img.gz ${D}*ystem.img 2>/dev/null | head -1)
+        [ -n "$BOOT" ] || { echo "!! 没有 boot.img"; fail=1; }
+        [ -n "$SYS" ] || { echo "!! 没有 system.img"; fail=1; }
+        ls -l ${D} 2>/dev/null | tail -15
+        echo "== 3) boot 里追加的 DTB 明文 token（gz 压缩的内核搜不到，DTB 是明文）=="
+        B=$BOOT
+        if [ -n "$B" ]; then
+          case "$B" in *.gz) gunzip -kc "$B" >/tmp/u01_boot.img; B=/tmp/u01_boot.img ;; esac
+          ls -l "$B"
+          for tok in u01_bat "bat:1" msm8916-xinxun-wf2 qcom,pm8916-lbc qcom,pm8916-bms-vm; do
+            n=$(grep -a -c -- "$tok" "$B" 2>/dev/null || true)
+            if [ "${n:-0}" -gt 0 ]; then echo "   OK $tok 命中 $n 行"; else echo "   NO $tok 在 boot 里搜不到"; fail=1; fi
+          done
+        fi
+        if [ "$fail" != 0 ]; then
+          echo "!! U01 产物校验没过：这一版就算刷进去也不满足需求（不充电 / 灯不对 / 镜像缺），停住不发 release"
+          exit 1
+        fi
+        echo "== U01 产物校验通过：内核开了 LBC 充电 + BMS-VM 电量计，boot/system 都在，DTB 带着 wf2 改动 =="
 
     - name: Get kernel version
       run: |
