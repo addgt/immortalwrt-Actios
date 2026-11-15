@@ -158,6 +158,44 @@ def check_charging(nodes):
     return out
 
 
+# 内核侧要存在的字符串：compatible 表项证明驱动编进来了（=y，不是 =m，.ko 不在这个包里），
+# power_supply 名字那两条证明它注册出来的名字就是我们验收要查的那个。
+KERN_TOKENS = [
+    (b"qcom,pm8916-lbc", "内核里有 LBC 驱动的 of_match 表项"),
+    (b"pm8916-lbc-chgr", "内核里会注册 power_supply 名 pm8916-lbc-chgr"),
+    (b"qcom,pm8916-bms-vm", "内核里有 BMS-VM 驱动的 of_match 表项"),
+    (b"pm8916-bms-vm", "内核里会注册 power_supply 名 pm8916-bms-vm"),
+    (b"qcom,fast-charge-safe-current", "内核真会去读我们注入的那个属性"),
+]
+
+
+def kernel_from_boot(data):
+    """从 android boot 里把内核解出来。解不出来返回 None（调用方判红，别默认通过）。"""
+    import zlib
+    o, n = 0, 0
+    while True:
+        i = data.find(b"\x1f\x8b\x08", o)
+        if i < 0:
+            return None
+        try:
+            raw = zlib.decompressobj(47).decompress(data[i:])
+        except Exception:
+            raw = None
+        if raw and len(raw) > 1 << 20:
+            print("  内核：gzip @ %#x，解出 %d B（第 %d 个候选流）" % (i, len(raw), n + 1))
+            return raw
+        o, n = i + 1, n + 1
+
+
+def check_kernel(data):
+    """boot 里那半是 gz 压缩的内核，明文 grep 搜不到——必须解压后再查字符串。"""
+    raw = kernel_from_boot(data)
+    if raw is None:
+        return [(False, "boot 里解不出 gzip 内核流（内核若改成 LZMA/未压缩，这条得在脚本来这里加一路）")]
+    return [(raw.count(tok) >= 1, "%s（命中 %d 次）" % (desc, raw.count(tok)))
+            for tok, desc in KERN_TOKENS]
+
+
 if __name__ == "__main__":
     argv = [x for x in sys.argv[1:]]
     check = "--check" in argv
@@ -212,4 +250,8 @@ if __name__ == "__main__":
                     print("    %-40s = <%s>  %s" % (n, " ".join("%08x" % x for x in words),
                                                     " ".join(strs(v)) if b"\0" in v else ""))
     if check:
+        print("\n== 内核侧（boot 里 gzip 解出来查字符串，明文 grep 是搜不到的）==")
+        for ok, msg in check_kernel(data):
+            print("  [%s] %s" % ("OK " if ok else "缺!", msg))
+            bad += 0 if ok else 1
         sys.exit(1 if bad else 0)
