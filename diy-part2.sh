@@ -241,6 +241,31 @@ else
 	[ -n "$u01_ref" ] && echo "::warning::打完补丁仍有文件引用 kmod-iptables：$(echo $u01_ref | tr '\n' ' ')"
 fi
 
+# ---- 8) 修上游两个驱动的类型判定（本次刷机后 dmesg 实测的失败点）----
+# 刷进去的 6.18.35 跑起来后，lbc 和 bms-vm 都只走到 probe 第一步就 -ENODEV：
+#   pm8916-bms-vm 200f000.spmi:pmic@0:battery@4000: error -ENODEV: Device reported wrong type: 0xFFFF020D
+#   pm8916-lbc    200f000.spmi:pmic@0:charger@1000: error -ENODEV: Device reported wrong type: 0xFFFF1502
+# 低 16 位 PM8916_BMS_VM_TYPE=0x020D / PM8916_LBC_CHGR_TYPE=0x1502 一模一样，高 16 位都是 0xFFFF。
+# 两处都写成：
+#   unsigned int tmp;
+#   regmap_bulk_read(map, reg + PM8916_PERPH_TYPE, &tmp, 2);   // SPMI val_bits=8 ⇒ 只填低 2 字节
+# count=2 只写缓冲区前 2 字节，`unsigned int` 的高半截是没初始化的栈垃圾就直接参与 != 比较
+# ⇒ 判定在任何 PM8916 上都恒假，跟本机硬件好坏无关（同一份文件的 FIFO 读数用的就是 u16 数组）。
+# BMS-VM 的 OCV 也用了同一个写法（last_ocv = tmp * 300），会把垃圾高位乘进电压里，一并换 u16。
+# 补丁基线 = gregkh/linux@v6.18.35 的两个文件原文，本地 patch -p1 往返验过才提交。
+# 目录名跟着 KERNEL_PATCHVER 走（别写死 patches-6.18）；内核片段会在 prepare 阶段按文件名排序打上。
+KPD=target/linux/msm89xx/patches-$KV
+KPPATCH_SRC="$REPO_DIR/u01_local/patches/pm8916-charger-type-check.patch"
+mkdir -p $KPD
+if [ -f "$KPD/900-pm8916-charger-type-check.patch" ]; then
+	echo "== U01：patches-$KV 里已经有 900-pm8916-charger-type-check.patch（fork 同步过？），不覆盖 =="
+elif [ -f "$KPPATCH_SRC" ]; then
+	cp "$KPPATCH_SRC" "$KPD/900-pm8916-charger-type-check.patch"
+	echo "== U01：已把类型判定补丁放进 $KPD/900-pm8916-charger-type-check.patch =="
+else
+	echo "!! 仓库里没带 u01_local/patches/pm8916-charger-type-check.patch，lbc/bms-vm 还是会 -ENODEV"
+fi
+
 # 注入自检：哪一项没落上就直接终止，别花一个半小时编一版跟上一版一样的固件
 u01_fail=0
 grep -q '^CONFIG_BATTERY_PM8916_BMS_VM=y' $CFG                       || { echo "!! BMS-VM 没进 $CFG"; u01_fail=1; }
@@ -265,6 +290,8 @@ command -v mcopy >/dev/null 2>&1    || { echo "!! 没有 mcopy，qcom-firmware �
 [ -f "$NFMK" ] || { echo "!! $NFMK 不在树里（锁定 hash 变了？路径找不到）"; u01_fail=1; }
 grep -q '^define KernelPackage/iptables$' $NFMK 2>/dev/null \
 	&& { echo "!! netfilter 合一补丁没生效，kmod-iptables 还在和 kmod-nf-ipt 抢 ip_tables.ko"; u01_fail=1; }
+[ -f "$KPD/900-pm8916-charger-type-check.patch" ] \
+	|| { echo "!! $KPD/900-pm8916-charger-type-check.patch 不在位，lbc/bms-vm 仍会 wrong type"; u01_fail=1; }
 if [ "$u01_fail" != 0 ]; then
 	echo "== U01 注入自检失败，终止编译 =="
 	ls -l "$OVL/etc/" 2>&1 | sed 's/^/   /'

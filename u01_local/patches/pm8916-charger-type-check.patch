@@ -1,0 +1,129 @@
+From: U01 route-B local fix <none>
+Subject: [PATCH] power: supply: pm8916: read the 16-bit peripheral type into u16
+
+Both pm8916-lbc and pm8916-bms-vm verify the PMIC peripheral type with
+regmap_bulk_read(..., &tmp, 2) into an uninitialised 'unsigned int'. Only the
+low two bytes are written, so the comparison against PM8916_*_TYPE sees stack
+garbage in the upper half and always fails:
+  pm8916-lbc ... error -ENODEV: Device reported wrong type: 0xFFFF1502
+  pm8916-bms-vm ... error -ENODEV: Device reported wrong type: 0xFFFF020D
+(low halves match the expected constants exactly, the PMIC is fine.)
+Same pattern in the BMS-VM OCV reads makes last_ocv = tmp * 300 carry garbage.
+Use u16 buffers, like the FIFO reads in the same file already do.
+--- a/drivers/power/supply/pm8916_lbc.c
++++ b/drivers/power/supply/pm8916_lbc.c
+@@ -256,6 +256,7 @@
+ 	struct power_supply_config psy_cfg = {};
+ 	int ret, len, irq;
+ 	unsigned int tmp;
++	u16 type;
+ 
+ 	chg = devm_kzalloc(dev, sizeof(*chg), GFP_KERNEL);
+ 	if (!chg)
+@@ -278,28 +279,28 @@
+ 	if (ret)
+ 		return ret;
+ 
+-	ret = regmap_bulk_read(chg->regmap, chg->reg[LBC_CHGR] + PM8916_PERPH_TYPE, &tmp, 2);
++	ret = regmap_bulk_read(chg->regmap, chg->reg[LBC_CHGR] + PM8916_PERPH_TYPE, &type, 2);
+ 	if (ret)
+ 		goto comm_error;
+-	if (tmp != PM8916_LBC_CHGR_TYPE)
++	if (type != PM8916_LBC_CHGR_TYPE)
+ 		goto type_error;
+ 
+-	ret = regmap_bulk_read(chg->regmap, chg->reg[LBC_BAT_IF] + PM8916_PERPH_TYPE, &tmp, 2);
++	ret = regmap_bulk_read(chg->regmap, chg->reg[LBC_BAT_IF] + PM8916_PERPH_TYPE, &type, 2);
+ 	if (ret)
+ 		goto comm_error;
+-	if (tmp != PM8916_LBC_BAT_IF_TYPE)
++	if (type != PM8916_LBC_BAT_IF_TYPE)
+ 		goto type_error;
+ 
+-	ret = regmap_bulk_read(chg->regmap, chg->reg[LBC_USB] + PM8916_PERPH_TYPE, &tmp, 2);
++	ret = regmap_bulk_read(chg->regmap, chg->reg[LBC_USB] + PM8916_PERPH_TYPE, &type, 2);
+ 	if (ret)
+ 		goto comm_error;
+-	if (tmp != PM8916_LBC_USB_TYPE)
++	if (type != PM8916_LBC_USB_TYPE)
+ 		goto type_error;
+ 
+-	ret = regmap_bulk_read(chg->regmap, chg->reg[LBC_MISC] + PM8916_PERPH_TYPE, &tmp, 2);
++	ret = regmap_bulk_read(chg->regmap, chg->reg[LBC_MISC] + PM8916_PERPH_TYPE, &type, 2);
+ 	if (ret)
+ 		goto comm_error;
+-	if (tmp != PM8916_LBC_MISC_TYPE)
++	if (type != PM8916_LBC_MISC_TYPE)
+ 		goto type_error;
+ 
+ 	ret = regmap_read(chg->regmap, chg->reg[LBC_CHGR] + PM8916_LBC_CHGR_CHG_OPTION, &tmp);
+@@ -358,7 +359,7 @@
+ 	return dev_err_probe(dev, ret, "Unable to communicate with device\n");
+ 
+ type_error:
+-	return dev_err_probe(dev, -ENODEV, "Device reported wrong type: 0x%X\n", tmp);
++	return dev_err_probe(dev, -ENODEV, "Device reported wrong type: 0x%X\n", type);
+ }
+ 
+ static const struct of_device_id pm8916_lbc_charger_of_match[] = {
+
+--- a/drivers/power/supply/pm8916_bms_vm.c
++++ b/drivers/power/supply/pm8916_bms_vm.c
+@@ -151,7 +151,8 @@
+ 	struct pm8916_bms_vm_battery *bat;
+ 	struct power_supply_config psy_cfg = {};
+ 	int ret, irq;
+-	unsigned int tmp;
++	u16 type;
++	u16 ocv;
+ 
+ 	bat = devm_kzalloc(dev, sizeof(*bat), GFP_KERNEL);
+ 	if (!bat)
+@@ -167,12 +168,12 @@
+ 	if (ret < 0)
+ 		return -EINVAL;
+ 
+-	ret = regmap_bulk_read(bat->regmap, bat->reg + PM8916_PERPH_TYPE, &tmp, 2);
++	ret = regmap_bulk_read(bat->regmap, bat->reg + PM8916_PERPH_TYPE, &type, 2);
+ 	if (ret)
+ 		goto comm_error;
+ 
+-	if (tmp != PM8916_BMS_VM_TYPE)
+-		return dev_err_probe(dev, -ENODEV, "Device reported wrong type: 0x%X\n", tmp);
++	if (type != PM8916_BMS_VM_TYPE)
++		return dev_err_probe(dev, -ENODEV, "Device reported wrong type: 0x%X\n", type);
+ 
+ 	ret = regmap_write(bat->regmap, bat->reg + PM8916_BMS_VM_S1_SAMPLE_INTERVAL_CTL,
+ 			   PM8916_BMS_VM_S1_SAMPLE_INTERVAL);
+@@ -192,12 +193,12 @@
+ 		goto comm_error;
+ 
+ 	ret = regmap_bulk_read(bat->regmap,
+-			       bat->reg + PM8916_BMS_VM_S3_S7_OCV_DATA0, &tmp, 2);
++			       bat->reg + PM8916_BMS_VM_S3_S7_OCV_DATA0, &ocv, 2);
+ 	if (ret)
+ 		goto comm_error;
+ 
+ 	bat->last_ocv_time = ktime_get_seconds();
+-	bat->last_ocv = tmp * 300;
++	bat->last_ocv = ocv * 300;
+ 	bat->vbat_now = bat->last_ocv;
+ 
+ 	psy_cfg.drv_data = bat;
+@@ -259,13 +260,13 @@
+ {
+ 	struct pm8916_bms_vm_battery *bat = platform_get_drvdata(pdev);
+ 	int ret;
+-	unsigned int tmp;
++	u16 ocv;
+ 
+ 	ret = regmap_bulk_read(bat->regmap,
+-			       bat->reg + PM8916_BMS_VM_S3_S7_OCV_DATA0, &tmp, 2);
++			       bat->reg + PM8916_BMS_VM_S3_S7_OCV_DATA0, &ocv, 2);
+ 
+ 	bat->last_ocv_time = ktime_get_seconds();
+-	bat->last_ocv = tmp * 300;
++	bat->last_ocv = ocv * 300;
+ 
+ 	ret = regmap_write(bat->regmap,
+ 			   bat->reg + PM8916_SEC_ACCESS, PM8916_SEC_MAGIC);
